@@ -395,6 +395,9 @@ function updateSubtitles(video) {
     player.append(track);
   });
   subtitleSelect.value = 'off';
+  for (const track of player.textTracks) {
+    track.mode = 'disabled';
+  }
 }
 
 function showResumePrompt(video, resumeTime, startup = false) {

@@ -55,7 +55,13 @@ function validateCatalog(items) {
       if (typeof subtitle.label !== 'string' || typeof subtitle.lang !== 'string') {
         throw new Error(`Subtitle entries for ${item.id} need label and lang values.`);
       }
-      resolveConfiguredPath(subtitle.src);
+      if (typeof subtitle.src === 'string') {
+        resolveConfiguredPath(subtitle.src);
+      } else if (typeof subtitle.streamIndex === 'number' && Number.isInteger(subtitle.streamIndex) && subtitle.streamIndex >= 0) {
+        // Valid embedded subtitle
+      } else {
+        throw new Error(`Subtitle entries for ${item.id} must specify either src or streamIndex.`);
+      }
     }
   }
   return items;
@@ -76,6 +82,92 @@ async function loadCatalog() {
   return validateCatalog(JSON.parse(contents));
 }
 
+const subtitleCache = new Map();
+
+function getEmbeddedSubtitles(inputFile) {
+  if (!subtitleCache.has(inputFile)) {
+    subtitleCache.set(inputFile, new Promise((resolve) => {
+      const ffprobe = spawn(process.env.FFPROBE_PATH || 'ffprobe', [
+        '-v', 'error',
+        '-show_entries', 'stream=index,codec_name,codec_type:stream_tags=language,title',
+        '-select_streams', 's',
+        '-of', 'json',
+        inputFile,
+      ], { stdio: ['ignore', 'pipe', 'pipe'] });
+
+      let output = '';
+      ffprobe.stdout.setEncoding('utf8');
+      ffprobe.stdout.on('data', (chunk) => { output += chunk; });
+      ffprobe.on('error', () => resolve([]));
+      ffprobe.on('close', (code) => {
+        if (code !== 0) {
+          resolve([]);
+          return;
+        }
+        try {
+          const parsed = JSON.parse(output.trim());
+          const streams = parsed.streams || [];
+          const imageCodecs = new Set(['dvd_subtitle', 'hdmv_pgs_subtitle', 'dvdsub', 'pgssub']);
+          const results = [];
+          const displayNames = new Intl.DisplayNames(['en'], { type: 'language' });
+          const seenLabels = new Map();
+
+          for (const stream of streams) {
+            if (imageCodecs.has(stream.codec_name)) continue;
+            const index = stream.index;
+            const tags = stream.tags || {};
+            const rawLang = typeof tags.language === 'string' ? tags.language.trim() : 'und';
+            const rawTitle = typeof tags.title === 'string' ? tags.title.trim() : '';
+
+            let baseLabel = rawTitle;
+            if (!baseLabel) {
+              if (rawLang && rawLang !== 'und') {
+                try {
+                  const resolvedName = displayNames.of(rawLang);
+                  baseLabel = resolvedName && resolvedName !== 'root' ? resolvedName : rawLang;
+                } catch {
+                  baseLabel = rawLang;
+                }
+              } else {
+                baseLabel = 'Subtitles';
+              }
+            }
+
+            const count = (seenLabels.get(baseLabel) || 0) + 1;
+            seenLabels.set(baseLabel, count);
+            const label = count > 1 ? `${baseLabel} (${count})` : baseLabel;
+
+            results.push({
+              label,
+              lang: rawLang !== 'und' ? rawLang : 'und',
+              streamIndex: index,
+            });
+          }
+          resolve(results);
+        } catch {
+          resolve([]);
+        }
+      });
+    }));
+  }
+  return subtitleCache.get(inputFile);
+}
+
+async function resolveVideoSubtitles(video) {
+  const explicitSubtitles = video.subtitles || [];
+  const hasEmbeddedInCatalog = explicitSubtitles.some((sub) => typeof sub.streamIndex === 'number');
+  if (hasEmbeddedInCatalog) {
+    return explicitSubtitles;
+  }
+  try {
+    const file = await getMediaFile(video.file_path);
+    const embedded = await getEmbeddedSubtitles(file);
+    return [...explicitSubtitles, ...embedded];
+  } catch {
+    return explicitSubtitles;
+  }
+}
+
 const app = express();
 app.disable('x-powered-by');
 
@@ -91,20 +183,24 @@ app.get('/api/videos', async (_request, response, next) => {
       undefined,
       { numeric: true, sensitivity: 'base' },
     ));
-    response.json(orderedVideos.map((video) => ({
-      id: video.id,
-      title: video.title,
-      category: video.category,
-      file_path: video.file_path,
-      subtitles: (video.subtitles || []).map((subtitle, index) => ({
-        label: subtitle.label,
-        lang: subtitle.lang,
-        src: `/api/videos/${encodeURIComponent(video.id)}/subtitles/${index}`,
-      })),
-      info: `/api/videos/${encodeURIComponent(video.id)}/info`,
-      audio: `/api/videos/${encodeURIComponent(video.id)}/audio`,
-      stream: `/api/videos/${encodeURIComponent(video.id)}/stream`,
-    })));
+    const result = await Promise.all(orderedVideos.map(async (video) => {
+      const subtitles = await resolveVideoSubtitles(video);
+      return {
+        id: video.id,
+        title: video.title,
+        category: video.category,
+        file_path: video.file_path,
+        subtitles: subtitles.map((subtitle, index) => ({
+          label: subtitle.label,
+          lang: subtitle.lang,
+          src: `/api/videos/${encodeURIComponent(video.id)}/subtitles/${index}`,
+        })),
+        info: `/api/videos/${encodeURIComponent(video.id)}/info`,
+        audio: `/api/videos/${encodeURIComponent(video.id)}/audio`,
+        stream: `/api/videos/${encodeURIComponent(video.id)}/stream`,
+      };
+    }));
+    response.json(result);
   } catch (error) {
     next(error);
   }
@@ -114,15 +210,71 @@ app.get('/api/videos/:id/subtitles/:index', async (request, response, next) => {
   try {
     const videos = await loadCatalog();
     const video = videos.find((entry) => entry.id === request.params.id);
+    if (!video) {
+      response.sendStatus(404);
+      return;
+    }
     const index = Number.parseInt(request.params.index, 10);
-    const subtitle = Number.isInteger(index) && index >= 0 ? video?.subtitles?.[index] : null;
+    const subtitles = await resolveVideoSubtitles(video);
+    const subtitle = Number.isInteger(index) && index >= 0 ? subtitles[index] : null;
     if (!subtitle) {
       response.sendStatus(404);
       return;
     }
 
-    const file = await getMediaFile(subtitle.src);
-    response.type('text/vtt').set('Cache-Control', 'no-store').sendFile(file);
+    if (subtitle.src) {
+      const file = await getMediaFile(subtitle.src);
+      response.type('text/vtt').set('Cache-Control', 'no-store').sendFile(file);
+      return;
+    }
+
+    if (typeof subtitle.streamIndex === 'number') {
+      const inputFile = await getMediaFile(video.file_path);
+      const ffmpegArgs = [
+        '-nostdin', '-hide_banner', '-loglevel', 'error',
+        '-i', inputFile,
+        '-map', `0:${subtitle.streamIndex}`,
+        '-f', 'webvtt', 'pipe:1',
+      ];
+      const ffmpeg = spawn(process.env.FFMPEG_PATH || 'ffmpeg', ffmpegArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
+
+      let stderr = '';
+      ffmpeg.stderr.setEncoding('utf8');
+      ffmpeg.stderr.on('data', (chunk) => {
+        stderr = `${stderr}${chunk}`.slice(-4096);
+      });
+
+      response.status(200).type('text/vtt').set({
+        'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff',
+      });
+
+      ffmpeg.on('error', (error) => {
+        if (!response.headersSent) {
+          response.status(500).json({ error: 'Unable to start FFmpeg for subtitle extraction.' });
+        } else {
+          response.destroy(error);
+        }
+      });
+      ffmpeg.on('close', (code) => {
+        if (code !== 0 && !response.destroyed) {
+          if (!response.headersSent) {
+            response.status(500).json({ error: 'FFmpeg could not extract subtitle track.' });
+          } else {
+            response.destroy(error);
+          }
+        }
+      });
+      response.on('close', () => {
+        if (!response.writableEnded && ffmpeg.exitCode === null) {
+          ffmpeg.kill('SIGTERM');
+        }
+      });
+      ffmpeg.stdout.pipe(response);
+      return;
+    }
+
+    response.sendStatus(404);
   } catch (error) {
     next(error);
   }
