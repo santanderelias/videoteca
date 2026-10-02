@@ -1,0 +1,17 @@
+[Unit]
+Description=VideoTeca private video server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/videoTeca
+ExecStart=/usr/bin/node %h/videoTeca/server.js
+Restart=on-failure
+RestartSec=3
+Environment=HOST=0.0.0.0
+Environment=PORT=3000
+Environment=MEDIA_ROOT=%h/videoTeca/src
+Environment=VIDEOS_FILE=%h/videoTeca/videos.json
+
+[Install]
+WantedBy=default.target

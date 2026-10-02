@@ -1,0 +1,15 @@
+{
+  "name": "videoteca",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "catalog:generate": "node scripts/generate-videos.js",
+    "check": "node --check server.js && node --check public/app.js && node --check scripts/test-stream.js && node --check scripts/generate-videos.js",
+    "test:stream": "node scripts/test-stream.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  }
+}
