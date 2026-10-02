@@ -1,3 +1,4 @@
+import { execFile } from 'node:child_process';
 import { readdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -122,6 +123,72 @@ function findSubtitles(videoPath, allFiles) {
     }));
 }
 
+async function findEmbeddedSubtitles(videoPath) {
+  const ffprobePath = process.env.FFPROBE_PATH || 'ffprobe';
+  return new Promise((resolve) => {
+    execFile(
+      ffprobePath,
+      [
+        '-v', 'error',
+        '-show_entries', 'stream=index,codec_name,codec_type:stream_tags=language,title',
+        '-select_streams', 's',
+        '-of', 'json',
+        videoPath,
+      ],
+      { encoding: 'utf8' },
+      (error, stdout) => {
+        if (error || !stdout) {
+          resolve([]);
+          return;
+        }
+        try {
+          const parsed = JSON.parse(stdout);
+          const streams = parsed.streams || [];
+          const imageCodecs = new Set(['dvd_subtitle', 'hdmv_pgs_subtitle', 'dvdsub', 'pgssub']);
+          const results = [];
+          const displayNames = new Intl.DisplayNames(['en'], { type: 'language' });
+          const seenLabels = new Map();
+
+          for (const stream of streams) {
+            if (imageCodecs.has(stream.codec_name)) continue;
+            const index = stream.index;
+            const tags = stream.tags || {};
+            const rawLang = typeof tags.language === 'string' ? tags.language.trim() : 'und';
+            const rawTitle = typeof tags.title === 'string' ? tags.title.trim() : '';
+
+            let baseLabel = rawTitle;
+            if (!baseLabel) {
+              if (rawLang && rawLang !== 'und') {
+                try {
+                  const resolvedName = displayNames.of(rawLang);
+                  baseLabel = resolvedName && resolvedName !== 'root' ? resolvedName : rawLang;
+                } catch {
+                  baseLabel = rawLang;
+                }
+              } else {
+                baseLabel = 'Subtitles';
+              }
+            }
+
+            const count = (seenLabels.get(baseLabel) || 0) + 1;
+            seenLabels.set(baseLabel, count);
+            const label = count > 1 ? `${baseLabel} (${count})` : baseLabel;
+
+            results.push({
+              label,
+              lang: rawLang !== 'und' ? rawLang : 'und',
+              streamIndex: index,
+            });
+          }
+          resolve(results);
+        } catch {
+          resolve([]);
+        }
+      },
+    );
+  });
+}
+
 async function main() {
   if (!isWithin(mediaRoot, scanRoot)) {
     throw new Error('The scan folder must be inside MEDIA_ROOT so generated paths can be streamed safely.');
@@ -137,17 +204,19 @@ async function main() {
   }
 
   const usedIds = new Set();
-  const catalog = videoFiles.map((filePath) => {
+  const catalog = await Promise.all(videoFiles.map(async (filePath) => {
     const relativePath = path.relative(mediaRoot, filePath).split(path.sep).join('/');
     const { title, category } = catalogDetails(filePath);
+    const externalSubs = findSubtitles(filePath, allFiles);
+    const embeddedSubs = await findEmbeddedSubtitles(filePath);
     return {
       id: makeId(relativePath, usedIds),
       title,
       category,
       file_path: relativePath,
-      subtitles: findSubtitles(filePath, allFiles),
+      subtitles: [...externalSubs, ...embeddedSubs],
     };
-  });
+  }));
 
   const previous = await readFile(videosFile, 'utf8').catch((error) => {
     if (error.code === 'ENOENT') return null;
